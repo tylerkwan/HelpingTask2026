@@ -1,2 +1,4 @@
 # HelpingTask2026
-Resources for publication
+
+Code and resources for Helping Task Development and Validation Publication, Kwan - Shin - Zavlis - Selai - Moutoussis
+
