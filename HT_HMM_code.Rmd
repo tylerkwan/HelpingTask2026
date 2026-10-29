@@ -1,0 +1,413 @@
+---
+Hidden Markov model (HMM) analyses for the Helping Task
+Code for: "Development and validation of a task for assessing help-seeker relational dynamics (2026)"
+authors: Kwan T*, Shin J, Selai C, Zavlis O, Moutoussis M (* corresponding author)
+---
+
+This markdown file reproduces every HMM analysis reported in the paper and the supplement. All analyses read the same dataset file (rename and replace where needed), `HT_dataset.csv`, which holds Study 1 (`STUDY = 1`) and Study 2 (`STUDY = 2`).
+
+== # == Analysis - Participants
+== 1 == HMM fitted to Study 1 (TP + LE)
+== 2 == HMM fitted to Study 1 (TP alone)
+== 3 == HMM fitted to Study 2 (Online sample)
+== 4 == #3's model applied to the LE participants, no re-fitting
+== 5 == HMM fitted to the combined online and LE data
+
+Participant groups:
+ - TP = typical participants (Study 1, IDs `TP..`; random Helper in all three blocks). 
+ - LE = lived experience with relational difficulties (Study 1, IDs `LE1`, `LE2`; CUC/CUU). 
+ - Online = Study 2 participants recruited through Prolific (IDs `PRO..`; CUC/CUU)
+
+Model:
+- Effort (1-4), satisfaction (1-6) and trust (1-6) are categorical emissions. 
+- Each row is the evaluation of trial *t* together with the effort chosen on trial *t*+1. 
+- Transition covariates describe the outcome of trial *t*+1, which is what happens between the two states (see Figure 2 in the main paper)
+- Models with 1 to 5 states are fitted from 15 random initialisations each. 
+- A number of states is retained only if its best solution is reached by at least 3 of the 15 initialisations and every state holds at least 5% of trials; the retained model with the lowest BIC is selected. 
+- States are numbered from lowest to highest expected trust.
+
+# Setup
+```{r setup, message = FALSE, warning = FALSE}
+
+library(dplyr)
+library(tidyr)
+library(depmixS4)
+
+data_dir <- "."
+N_STARTS <- 15     # random initialisations per model
+MIN_INIT <- 3      # initialisations that must reach the best solution
+MIN_OCC  <- 0.05   # smallest share of trials any state may hold
+K_MAX    <- 5      # largest number of states fitted
+```
+
+## Load dataset
+
+```{r load-data}
+
+raw <- read.csv(file.path(data_dir, "HT_dataset.csv"), stringsAsFactors = FALSE, check.names = FALSE)
+
+data <- raw %>%
+  rename(
+    pid             = PID,
+    study           = STUDY,
+    trial           = Trial,
+    block           = Block,
+    policy          = 'Helper Policy',
+    effort_intended = 'Effort Intended',
+    effort_actual   = 'Effort Actual',
+    partner_effort  = 'Helper Effort',
+    satisfaction    = 'Satisfaction Rating',
+    trust           = 'Trust Rating',
+    points_helper   = 'Points For Helper',
+    points_seeker   = 'Points For Help-Seeker') %>%
+  group_by(pid) %>%
+  mutate(design = case_when(all(policy == "RANDOM")                 ~ "Random",
+                            policy[block == 3][1] == "CARING"       ~ "CUC",
+                            TRUE                                    ~ "CUU")) %>%
+  ungroup() %>%
+  mutate(group = case_when(study == 2          ~ "Online",
+                           design == "Random"  ~ "TP",
+                           TRUE                ~ "LE")) %>%
+  arrange(pid, block, trial)
+
+data %>% distinct(pid, study, group, design) %>% count(study, group, design)
+```
+
+# Prep Data
+
+```{r functions-data}
+cov_cols <- c("partner_effort_z", "payoff_diff_z", "effort_diff_z")
+
+prepare_data <- function(dat, z_ref = NULL) {
+  d <- dat %>%
+    arrange(pid, block, trial) %>%
+    group_by(pid, block) %>%
+    mutate(block_trial         = row_number(),
+           effort_selection    = lead(effort_intended),
+           next_partner_effort = lead(partner_effort),
+           next_effort_actual  = lead(effort_actual),
+           next_points_seeker  = lead(points_seeker),
+           next_points_helper  = lead(points_helper),
+           half = ifelse(block_trial <= n() / 2, "First half", "Second half")) %>%
+    ungroup() %>%
+    mutate(next_payoff_diff = next_points_seeker - next_points_helper,   # + = participant came out ahead
+           next_effort_diff = next_partner_effort - next_effort_actual)  # + = Helper gave more than participant
+
+  ref <- if (is.null(z_ref)) d else z_ref
+  z   <- function(var) (d[[var]] - mean(ref[[var]], na.rm = TRUE)) / sd(ref[[var]], na.rm = TRUE)
+
+  d <- d %>% mutate(
+    partner_effort_z = z("next_partner_effort"),
+    payoff_diff_z    = z("next_payoff_diff"),
+    effort_diff_z    = z("next_effort_diff"),
+    effort_f = factor(effort_selection, levels = 1:4),   # responses as categories
+    sat_f    = factor(satisfaction,     levels = 1:6),
+    trust_f  = factor(trust,            levels = 1:6),
+    policy_lab = case_when(policy == "CARING"   ~ "Caring",
+                           policy == "UNCARING" ~ "Uncaring",
+                           TRUE                 ~ "Random"))
+  for (cc in cov_cols) d[[cc]][is.na(d[[cc]])] <- 0
+
+
+  tp_ids <- sort(unique(d$pid[d$group == "TP"]))
+  d$pid_label <- ifelse(d$group == "TP", sprintf("P%02d", match(d$pid, tp_ids)), d$pid)
+
+  attr(d, "ntimes") <- d %>% count(pid, block) %>% pull(n)   # one sequence per participant x block
+  cat("Participants:", n_distinct(d$pid), " Blocks:", length(attr(d, "ntimes")),
+      " Rows:", nrow(d), "\n")
+  d
+}
+```
+
+# Setup HMM Model Fitting
+
+```{r functions-model}
+build_hmm <- function(d, k, trans_formula = ~ 1) {
+  depmix(list(effort_f ~ 1, sat_f ~ 1, trust_f ~ 1), data = d,
+         nstates = k, ntimes = attr(d, "ntimes"), transition = trans_formula,
+         family = list(multinomial("identity"), multinomial("identity"),
+                       multinomial("identity")))
+}
+
+fit_hmm <- function(d, k, trans_formula = ~ 1, n_starts = N_STARTS, seed_base = 1000) {
+  best <- NULL; lls <- c()
+  for (s in seq_len(n_starts)) {
+    set.seed(seed_base + s)
+    f <- NULL
+    invisible(capture.output(      # hides depmixS4's "converged at iteration ..." messages
+      f <- tryCatch(suppressWarnings(fit(build_hmm(d, k, trans_formula), verbose = FALSE,
+             emcontrol = em.control(maxit = 1000, random.start = TRUE))),
+             error = function(e) NULL)))
+    if (is.null(f)) next
+    lls <- c(lls, as.numeric(logLik(f)))
+    if (is.null(best) || as.numeric(logLik(f)) > as.numeric(logLik(best))) best <- f
+  }
+  ## initialisations that reached the best solution (within 0.1 log-likelihood)
+  list(fit = best, n_at_best = sum(lls > max(lls) - 0.1))
+}
+
+## depmixS4's BIC() drops rows with a missing response (the last row of every
+## block). Every row is counted here instead.
+ll_of  <- function(f) as.numeric(suppressWarnings(logLik(f)))
+npar   <- function(f) attr(suppressWarnings(logLik(f)), "df")
+bic_of <- function(f, n) -2 * ll_of(f) + log(n) * npar(f)
+
+## Most likely state sequence (Viterbi). depmixS4's posterior(type = "viterbi")
+## reads the transition covariate from the row after each move, while fitting
+## reads it from the row before. This version uses the same row as fitting.
+## Without covariates the two give identical results.
+viterbi_fixed <- function(f, ntimes) {
+  dens <- f@dens
+  dens[is.na(dens)] <- 1                        # a missing response carries no information
+  B <- apply(dens, c(1, 3), prod)               # P(responses | state) for every row
+  A <- f@trDens                                 # A[row, to, from]
+  ends <- cumsum(ntimes); starts <- ends - ntimes + 1
+  state <- integer(nrow(B))
+  for (s in seq_along(ntimes)) {
+    rows <- starts[s]:ends[s]; n <- length(rows); k <- ncol(B)
+    delta <- matrix(-Inf, n, k); back <- matrix(0L, n, k)
+    delta[1, ] <- log(f@init[s, ]) + log(B[rows[1], ])
+    for (t in 2:n) {
+      a <- if (dim(A)[1] == 1) 1 else rows[t - 1]
+      for (j in 1:k) {
+        cand <- delta[t - 1, ] + log(A[a, j, ])
+        back[t, j]  <- which.max(cand)
+        delta[t, j] <- max(cand) + log(B[rows[t], j])
+      }
+    }
+    path <- integer(n); path[n] <- which.max(delta[n, ])
+    for (t in (n - 1):1) path[t] <- back[t + 1, path[t + 1]]
+    state[rows] <- path
+  }
+  state
+}
+
+## P(next state | state i) for given covariate values
+trans_probs <- function(f, i, newdata) {
+  tm <- f@transition[[i]]
+  B  <- tm@parameters$coefficients
+  if (tm@family$link == "identity")
+    return(matrix(as.numeric(B), nrow = NROW(newdata), ncol = length(B), byrow = TRUE))
+  X   <- model.matrix(delete.response(terms(tm@formula)), newdata)
+  eta <- X %*% as.matrix(B)
+  exp(eta) / rowSums(exp(eta))
+}
+
+## Transition covariates compared (all describe the next trial)
+specs <- list(
+  "Null (no covariate)" = ~ 1,
+  "Helper's effort"     = ~ partner_effort_z,   # what the Helper did
+  "Payoff difference"   = ~ payoff_diff_z,      # own points - Helper's points
+  "Effort difference"   = ~ effort_diff_z)      # Helper's effort - own actual effort
+
+run_hmm <- function(d) {
+  n <- nrow(d)
+
+  ## 1. Number of states
+  selection <- data.frame()
+  for (k in 1:K_MAX) {
+    r   <- fit_hmm(d, k, seed_base = 1000 * k)
+    occ <- colMeans(posterior(r$fit, type = "smoothing"))
+    selection <- rbind(selection, data.frame(
+      k = k, logLik = round(ll_of(r$fit), 1), npar = npar(r$fit), BIC = round(bic_of(r$fit, n), 1),
+      inits_at_best = r$n_at_best, smallest_state = round(min(occ), 3)))
+  }
+  selection$retained <- selection$inits_at_best >= MIN_INIT & selection$smallest_state >= MIN_OCC
+  best_k <- with(selection[selection$retained, ], k[which.min(BIC)])
+  cat("\nNumber of states:\n"); print(selection)
+  cat("Selected k =", best_k, "\n")
+
+  ## 2. Transition covariates
+  fits <- list()
+  for (j in seq_along(specs))
+    fits[[names(specs)[j]]] <- fit_hmm(d, best_k, specs[[j]], n_starts = ifelse(j == 1, N_STARTS, 10),
+                                       seed_base = 50000 + 1000 * j)$fit
+  null <- "Null (no covariate)"
+  comp <- tibble(model  = names(fits),
+                 logLik = sapply(fits, ll_of),
+                 npar   = sapply(fits, npar),
+                 BIC    = sapply(fits, bic_of, n = n)) %>%
+    mutate(dBIC = BIC - BIC[model == null],
+           LR   = 2 * (logLik - logLik[model == null]),
+           df   = npar - npar[model == null],
+           p    = ifelse(df > 0, pchisq(LR, df, lower.tail = FALSE), NA)) %>%
+    arrange(BIC)
+  winner_name <- comp$model[1]                  # lowest BIC (can be the null)
+  winner      <- fits[[winner_name]]
+  cat("\nTransition covariates:\n"); print(comp, width = Inf)
+  cat("Winning model:", winner_name, "\n")
+
+  ## 3. Winning model: states ordered from lowest to highest expected trust
+  state_labels <- paste("State", 1:best_k)
+  emis_mean <- function(i, r) { p <- getpars(winner@response[[i]][[r]]); sum(seq_along(p) * p) }
+  ord <- order(sapply(1:best_k, emis_mean, r = 3))
+
+  d$state <- factor(state_labels[match(viterbi_fixed(winner, attr(d, "ntimes")), ord)],
+                    levels = state_labels)
+  post <- posterior(winner, type = "smoothing")[, ord]
+  colnames(post) <- paste0("p_", state_labels)
+  d <- bind_cols(d, as.data.frame(post))
+  cat("\nMean certainty of the decoded state:", round(mean(apply(post, 1, max)), 3), "\n")
+
+  channels <- c("Effort", "Satisfaction", "Trust")
+  emis <- do.call(rbind, lapply(1:best_k, function(i) do.call(rbind, lapply(1:3, function(r) {
+    p <- getpars(winner@response[[ord[i]]][[r]])
+    data.frame(state = state_labels[i], channel = channels[r], value = seq_along(p), prob = as.numeric(p))
+  }))))
+  emis$state <- factor(emis$state, levels = state_labels)
+  profile <- emis %>% group_by(state, channel) %>%
+    summarise(mean = sum(value * prob), .groups = "drop") %>%
+    pivot_wider(names_from = channel, values_from = mean)
+  cat("\nState profiles (model expected values):\n"); print(as.data.frame(profile), digits = 3)
+
+  avg <- d[1, ]; for (v in cov_cols) avg[[v]] <- 0   # average covariate values
+  trans_mat <- t(sapply(1:best_k, function(i) trans_probs(winner, ord[i], avg)[1, ord]))
+  dimnames(trans_mat) <- list(from = state_labels, to = state_labels)
+  cat("\nTransition matrix (average covariate values):\n"); print(round(trans_mat, 3))
+
+  list(data = d, selection = selection, best_k = best_k, fits = fits, comp = comp,
+       winner = winner, winner_name = winner_name, state_labels = state_labels, ord = ord,
+       emis = emis, profile = profile, trans_mat = trans_mat)
+}
+
+## Per-participant occupancy (% of trials in each decoded state), written to CSV
+write_occupancy <- function(res, file) {
+  occ <- res$data %>% count(pid, pid_label, group, design, state, .drop = FALSE) %>%
+    group_by(pid) %>% mutate(pct = round(100 * n / sum(n), 1)) %>% ungroup() %>%
+    dplyr::select(pid, pid_label, group, design, state, pct) %>%
+    pivot_wider(names_from = state, values_from = pct, values_fill = 0)
+  write.csv(occ, file.path(data_dir, file), row.names = FALSE)
+  invisible(occ)
+}
+
+## Mean smoothed state probabilities by any grouping
+occupancy_by <- function(res, ...) {
+  res$data %>% group_by(...) %>%
+    summarise(rows = n(), across(starts_with("p_"), mean), .groups = "drop") %>%
+    as.data.frame()
+}
+
+## Caring vs uncaring occupancy, one value per participant (paired Wilcoxon, Holm)
+policy_tests <- function(res) {
+  occ <- res$data %>% filter(policy_lab != "Random") %>% group_by(pid, policy_lab) %>%
+    summarise(across(starts_with("p_"), mean), .groups = "drop")
+  out <- do.call(rbind, lapply(res$state_labels, function(s) {
+    wide <- occ %>% dplyr::select(pid, policy_lab, occ = all_of(paste0("p_", s))) %>%
+      pivot_wider(names_from = policy_lab, values_from = occ)
+    w <- suppressWarnings(wilcox.test(wide$Caring, wide$Uncaring, paired = TRUE, exact = FALSE))
+    data.frame(state = s, caring = mean(wide$Caring), uncaring = mean(wide$Uncaring), p = w$p.value)
+  }))
+  out$p_holm <- p.adjust(out$p, method = "holm")
+  out
+}
+
+## Save one analysis as .RData. Stores the whole result list as `res`, plus each
+## piece under the names the figure code uses, plus the helpers it needs, so the
+## figures can be made in a fresh R session with just load().
+save_results <- function(res, file) {
+  e <- new.env()
+  e$res          <- res
+  e$data_adj     <- res$data
+  e$seq_id       <- paste(res$data$pid, res$data$block)      # one sequence per participant x block
+  e$ntimes_block <- attr(res$data, "ntimes")
+  sel <- res$selection
+  sel$starts_at_best <- sel$inits_at_best                    # names used in the figure code
+  sel$reliable       <- sel$retained
+  e$selection    <- sel
+  for (nm in c("best_k", "fits", "comp", "winner", "winner_name", "state_labels",
+               "ord", "emis", "profile", "trans_mat")) assign(nm, res[[nm]], envir = e)
+  e$cov_vars     <- all.vars(specs[[res$winner_name]])       # empty if the null model wins
+  e$cov_cols     <- cov_cols
+  e$specs        <- specs
+  e$trans_probs  <- trans_probs
+  save(list = ls(e), envir = e, file = file.path(data_dir, file))
+}
+```
+
+# 1. Study 1: TP + LE
+
+```{r analysis-1}
+d1   <- prepare_data(filter(data, study == 1))
+res1 <- run_hmm(d1)
+
+occupancy_by(res1, group, design, policy_lab)
+write_occupancy(res1, "occupancy_1_study1.csv")
+save_results(res1, "hmm_1_study1.RData")
+
+```
+
+# 2. Study 1: TP alone
+
+```{r analysis-2}
+d2   <- prepare_data(filter(data, study == 1, group == "TP"))
+res2 <- run_hmm(d2)
+
+write_occupancy(res2, "occupancy_2_tp.csv")
+save_results(res2, "hmm_2_tp.RData")
+```
+
+# 3. Study 2: online sample
+
+```{r analysis-3}
+d3   <- prepare_data(filter(data, study == 2))
+res3 <- run_hmm(d3)
+
+occupancy_by(res3, policy_lab, half)
+policy_tests(res3)
+write_occupancy(res3, "occupancy_3_online.csv")
+save_results(res3, "hmm_3_online.RData")
+```
+
+# 4. LE participants under the Study 2 model (no re-fitting)
+
+```{r analysis-4}
+if (!exists("res3")) { load(file.path(data_dir, "hmm_3_online.RData")); res3 <- res }
+
+d4 <- prepare_data(filter(data, group == "LE"), z_ref = res3$data)
+
+## Same structure as the Study 2 winner, with its estimates copied in (no fit()).
+## Build only on data containing every response category: depmixS4 drops
+## categories that never occur, which would change the parameter count.
+with_fixed_pars <- function(d, res) {
+  m <- build_hmm(d, res$best_k, specs[[res$winner_name]])
+  p <- getpars(res$winner)
+  if (length(getpars(m)) != length(p))
+    stop("Parameter count differs from the fitted model: a response category is missing from these data")
+  setpars(m, p)
+}
+
+## Check: re-evaluating on the Study 2 data reproduces its log-likelihood
+stopifnot(abs(ll_of(with_fixed_pars(res3$data, res3)) - ll_of(res3$winner)) < 1e-3)
+
+fb       <- forwardbackward(with_fixed_pars(d4, res3))
+ll_fixed <- fb$logLike
+ll_on    <- ll_of(res3$winner)
+n_on     <- nrow(res3$data)
+n_LE    <- nrow(d4)
+ll_chance <- sum(ifelse(is.na(d4$effort_f), 0, log(1/4))) + n_LE * 2 * log(1/6)
+
+data.frame(
+  data       = c("Online (model fitted to these data)", "LE (online model, fixed)", "LE, chance"),
+  rows       = c(n_on, n_LE, n_LE),
+  logLik     = c(ll_on, ll_fixed, ll_chance),
+  ll_per_row = c(ll_on / n_on, ll_fixed / n_LE, ll_chance / n_LE))
+
+## Per LE participant: each row's contribution under the one fixed model
+row_ll <- -log(fb$sca)
+stopifnot(abs(sum(row_ll) - ll_fixed) < 1e-4)
+d4 %>% mutate(row_ll = row_ll) %>% group_by(pid, design) %>%
+  summarise(rows = n(), logLik = sum(row_ll), .groups = "drop") %>%
+  mutate(ll_per_row = logLik / rows) %>% as.data.frame()
+```
+
+# 5. Combined online and LE data
+
+```{r analysis-5}
+d5   <- prepare_data(filter(data, group %in% c("Online", "LE")))
+res5 <- run_hmm(d5)
+
+occupancy_by(res5, policy_lab, half)
+policy_tests(res5)
+write_occupancy(res5, "occupancy_5_online_LE.csv")
+save_results(res5, "hmm_5_online_le.RData")
+```
